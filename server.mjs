@@ -5,10 +5,12 @@ import {mkdirSync,readFileSync} from 'node:fs';
 import {extname,resolve} from 'node:path';
 import {recommend} from './recommend.mjs';
 import {seeds} from './seed.mjs';
+import {seedDemo} from './demo.mjs';
 mkdirSync('data',{recursive:true});
 const db=new DatabaseSync(process.env.DB_PATH||'data/app.sqlite');
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,username TEXT UNIQUE,password TEXT,bio TEXT DEFAULT '周末很短，世界很大。',interests TEXT DEFAULT '户外自然,城市漫步');
+CREATE TABLE IF NOT EXISTS demo_profiles(user_id INTEGER PRIMARY KEY REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id INTEGER REFERENCES users(id),expires INTEGER);
 CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),title TEXT,body TEXT,place TEXT,category TEXT,budget REAL,hours REAL,lat REAL,lon REAL,indoor INTEGER,image TEXT,original_id INTEGER REFERENCES posts(id),demo INTEGER DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS likes(user_id INTEGER REFERENCES users(id),post_id INTEGER REFERENCES posts(id),PRIMARY KEY(user_id,post_id));
@@ -22,7 +24,9 @@ if(!one('SELECT id FROM users LIMIT 1')) {
  ['山野收集员','小岛同学','一颗栗子'].forEach((n,i)=>run('INSERT INTO users(id,name,bio) VALUES(?,?,?)',i+1,n,'示例作者 · 一起发现城市的另一面'));
  seeds.forEach(([title,place,category,budget,hours,lat,lon,indoor,img,body,uid])=>run('INSERT INTO posts(user_id,title,body,place,category,budget,hours,lat,lon,indoor,image,demo) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)',uid,title,body,place,category,budget,hours,lat,lon,indoor,`https://images.unsplash.com/${img}?auto=format&fit=crop&w=800&q=85`));
 }
-const publicUser=u=>u&&({id:u.id,name:u.name,bio:u.bio,interests:u.interests});
+// Backfill existing experience accounts before serving any old browser sessions.
+for(const u of all('SELECT id FROM users WHERE username IS NULL AND id>3')) seedDemo(db,u.id);
+const publicUser=u=>u&&({id:u.id,name:u.name,bio:u.bio,interests:u.interests,demo:!u.username&&u.id>3});
 const postSql=`SELECT p.*,u.name,(SELECT count(*) FROM likes WHERE post_id=p.id) likes,(SELECT count(*) FROM comments WHERE post_id=p.id) comments FROM posts p JOIN users u ON u.id=p.user_id`;
 const err=(msg,status=400)=>{throw Object.assign(new Error(msg),{status});};
 const str=(v,max=2000)=>{if(typeof v!=='string'||!v.trim()||v.length>max)err('请检查输入内容及长度');return v.trim();};
@@ -38,14 +42,15 @@ const server=createServer(async(req,res)=>{
  const json=(data,status=200)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(data));};
  try{
  const url=new URL(req.url,'http://localhost'),path=url.pathname,method=req.method;
- if(!path.startsWith('/api/')){if(method!=='GET'&&method!=='HEAD')err('不支持的方法',405);const file=path==='/'?'index.html':decodeURIComponent(path.slice(1));const full=resolve('public',file);if(!full.startsWith(resolve('public')+'/'))err('禁止访问',403);try{const data=readFileSync(full);res.writeHead(200,{'Content-Type':({'.html':'text/html; charset=utf-8','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.webmanifest':'application/manifest+json'})[extname(full)]||'application/octet-stream','X-Content-Type-Options':'nosniff'});res.end(method==='HEAD'?undefined:data);}catch{json({error:'页面不存在'},404);}return;}
+ if(!path.startsWith('/api/')){if(method!=='GET'&&method!=='HEAD')err('不支持的方法',405);const file=path==='/'?'index.html':decodeURIComponent(path.slice(1));const full=resolve('public',file);if(!full.startsWith(resolve('public')+'/'))err('禁止访问',403);try{const data=readFileSync(full);res.writeHead(200,{'Content-Type':({'.html':'text/html; charset=utf-8','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.webmanifest':'application/manifest+json'})[extname(full)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control':'no-store'});res.end(method==='HEAD'?undefined:data);}catch{json({error:'页面不存在'},404);}return;}
  if(!['GET','HEAD'].includes(method)&&req.headers.origin&&req.headers.origin!==`http://${req.headers.host}`&&req.headers.origin!==`https://${req.headers.host}`)err('来源不被允许',403);
  const token=(req.headers.cookie||'').match(/(?:^|; )session=([a-f0-9]+)/)?.[1];
  const me=token?one('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE token=? AND expires>?',token,Date.now()):null;
- if(path==='/api/me'&&method==='GET')return json(publicUser(me)||null);
+ if(me&&!me.username&&me.id>3)seedDemo(db,me.id);
+ if(path==='/api/me'&&method==='GET'){if(me&&!me.username&&me.id>3){seedDemo(db,me.id);return json(publicUser(one('SELECT * FROM users WHERE id=?',me.id)));}return json(publicUser(me)||null);}
  if(path==='/api/auth'&&method==='POST'){
   const b=await body(req);let u;
-  if(b.mode==='demo'){const id=run('INSERT INTO users(name) VALUES(?)','周末体验家').lastInsertRowid;u=one('SELECT * FROM users WHERE id=?',id);}
+  if(b.mode==='demo'){const id=run('INSERT INTO users(name) VALUES(?)','周末体验家').lastInsertRowid;seedDemo(db,Number(id));u=one('SELECT * FROM users WHERE id=?',id);}
   else {const username=str(b.username,50),password=str(b.password,128);if(password.length<8)err('密码至少需要 8 位');
    if(b.mode==='register'){if(one('SELECT id FROM users WHERE username=?',username))err('用户名已被使用');const salt=randomBytes(16).toString('hex');const hash=scryptSync(password,salt,64).toString('hex');const id=run('INSERT INTO users(name,username,password) VALUES(?,?,?)',str(b.name,30),username,`${salt}:${hash}`).lastInsertRowid;u=one('SELECT * FROM users WHERE id=?',id);}
    else {u=one('SELECT * FROM users WHERE username=?',username);if(!u?.password)err('帐号或密码不正确',401);const [salt,hash]=u.password.split(':');if(!timingSafeEqual(scryptSync(password,salt,64),Buffer.from(hash,'hex')))err('帐号或密码不正确',401);}}
@@ -56,7 +61,7 @@ const server=createServer(async(req,res)=>{
  if(path==='/api/posts'&&method==='GET'){
   const opts=Object.fromEntries(url.searchParams);for(const [k,min,max] of [['lat',-90,90],['lon',-180,180],['budget',0,100000],['hours',0,168],['radius',0,20050]])if(k in opts)opts[k]=num(opts[k],min,max);
   if(opts.weather==='wet')opts.weather={code:61};else if(opts.weather==='dry')opts.weather={code:0};else opts.weather=null;
-  opts.interests=me?.interests||opts.interests||'';let rows=all(postSql);
+  opts.interests=me?.interests||opts.interests||'';let rows=all(postSql).filter(p=>p.user_id===me?.id||!one('SELECT 1 FROM demo_profiles WHERE user_id=?',p.user_id));
   if(opts.user)rows=rows.filter(p=>p.user_id===+opts.user);
   if(opts.following==='1')rows=rows.filter(p=>me&&one('SELECT 1 FROM follows WHERE user_id=? AND target_id=?',me.id,p.user_id));
   return json(recommend(rows,opts));
@@ -84,6 +89,7 @@ const server=createServer(async(req,res)=>{
  if(m&&method==='POST'){const g=one('SELECT * FROM groups WHERE id=?',+m[1]);if(!g)err('组团不存在',404);if(Date.parse(g.date)<=Date.now())err('组团已过期');if(one('SELECT 1 FROM members WHERE group_id=? AND user_id=?',g.id,me.id))err('你已加入该组团');if(one('SELECT count(*) n FROM members WHERE group_id=?',g.id).n>=g.capacity)err('组团已满员');run('INSERT INTO members VALUES(?,?)',g.id,me.id);return json({ok:true});}
  m=path.match(/^\/api\/users\/(\d+)\/follow$/);
  if(m&&method==='POST'){const id=+m[1];if(id===me.id||!one('SELECT id FROM users WHERE id=?',id))err('无法关注该用户');if(one('SELECT 1 FROM follows WHERE user_id=? AND target_id=?',me.id,id))run('DELETE FROM follows WHERE user_id=? AND target_id=?',me.id,id);else run('INSERT INTO follows VALUES(?,?)',me.id,id);return json({ok:true});}
+ if(path==='/api/friends/feed'&&method==='GET')return json(all(postSql+' WHERE EXISTS(SELECT 1 FROM follows f WHERE f.user_id=? AND f.target_id=p.user_id) AND EXISTS(SELECT 1 FROM follows f WHERE f.user_id=p.user_id AND f.target_id=?) ORDER BY p.created DESC,p.id DESC',me.id,me.id));
  if(path==='/api/friends'&&method==='GET')return json(all('SELECT u.id,u.name,u.bio,EXISTS(SELECT 1 FROM follows WHERE user_id=u.id AND target_id=?) mutual FROM follows f JOIN users u ON u.id=f.target_id WHERE f.user_id=?',me.id,me.id));
  if(path==='/api/conversations'&&method==='GET')return json(all(`SELECT u.id,u.name,(SELECT body FROM messages WHERE (sender=u.id AND recipient=?) OR (sender=? AND recipient=u.id) ORDER BY id DESC LIMIT 1) last FROM users u WHERE u.id IN (SELECT sender FROM messages WHERE recipient=? UNION SELECT recipient FROM messages WHERE sender=?)`,me.id,me.id,me.id,me.id));
  m=path.match(/^\/api\/messages\/(\d+)$/);

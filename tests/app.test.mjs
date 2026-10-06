@@ -1,0 +1,41 @@
+import {test,before,after} from 'node:test';
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {recommend,distance} from '../recommend.mjs';
+let server,dir,a,b,c,pid,gid;
+const base='http://127.0.0.1:3011/api';
+async function req(path,method='GET',body,cookie){const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(cookie?{Cookie:cookie}:{})},body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,data:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};}
+before(async()=>{dir=await mkdtemp(join(tmpdir(),'chugemen-test-'));server=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'3011',DB_PATH:join(dir,'test.sqlite')},stdio:['ignore','pipe','pipe']});await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('server timeout')),5000);server.stdout.on('data',()=>{clearTimeout(timer);resolve();});server.on('error',reject);server.on('exit',code=>{if(code)reject(Error('server exit '+code));});});});
+after(async()=>{if(server&&server.exitCode===null){const exited=new Promise(r=>server.once('exit',r));server.kill();await exited;}if(dir)await rm(dir,{recursive:true,force:true});});
+test('recommendation filters distance, budget and time; boosts interests and weather',()=>{assert.equal(distance(30,120,30,120),0);const rows=[{id:1,lat:30,lon:120,budget:20,hours:2,category:'艺术',indoor:1},{id:2,lat:30,lon:120,budget:0,hours:2,category:'自然',indoor:0},{id:3,lat:30,lon:120,budget:200,hours:9,category:'自然',indoor:0}];assert.equal(recommend(rows,{lat:30,lon:120,interests:'艺术',weather:{code:61},hours:3,budget:50})[0].id,1);assert.equal(recommend(rows,{lat:0,lon:0,radius:10}).length,0);assert.equal(recommend(rows,{lat:30,lon:120,budget:0}).length,1);});
+test('public feed and auth enforce sessions',async()=>{assert.equal((await req('/posts')).data.length,8);assert.equal((await req('/posts','POST',{})).status,401);a=await req('/auth','POST',{mode:'register',name:'测试甲',username:'test-a',password:'test-pass-123'});assert.equal(a.status,200);assert.ok(a.cookie);assert.equal((await req('/auth','POST',{mode:'login',username:'test-a',password:'incorrect'})).status,401);assert.equal((await req('/auth','POST',{mode:'login',username:'test-a',password:'test-pass-123'})).status,200);b=await req('/auth','POST',{mode:'demo'});c=await req('/auth','POST',{mode:'demo'});assert.notEqual(b.data.id,c.data.id);});
+test('publish, comment, like toggle, repost preserve authorship',async()=>{const r=await req('/posts','POST',{title:'测试旅行',body:'一份真实的测试记录',place:'测试公园',category:'户外自然',budget:12,hours:2,lat:30.25,lon:120.15,indoor:false,image:'https://images.unsplash.com/photo-1441974231531-c6227db76b6e'},a.cookie);assert.equal(r.status,201);pid=r.data.id;await req(`/posts/${pid}/comment`,'POST',{body:'一起出发'},b.cookie);await req(`/posts/${pid}/like`,'POST',{},b.cookie);let p=(await req('/posts/'+pid,'GET',undefined,b.cookie)).data;assert.equal(p.commentList.length,1);assert.equal(p.likes,1);assert.equal(p.liked,true);await req(`/posts/${pid}/like`,'POST',{},b.cookie);assert.equal((await req('/posts/'+pid)).data.likes,0);const repost=await req(`/posts/${pid}/repost`,'POST',{body:'想去'},b.cookie);assert.equal((await req('/posts/'+repost.data.id)).data.original_id,pid);});
+test('groups enforce capacity, duplicate membership and dates',async()=>{assert.equal((await req(`/posts/${pid}/group`,'POST',{date:'2000-01-01',capacity:2},a.cookie)).status,400);assert.equal((await req(`/posts/${pid}/group`,'POST',{date:new Date(Date.now()+86400000).toISOString(),capacity:2},a.cookie)).status,200);gid=(await req('/posts/'+pid)).data.groups[0].id;assert.equal((await req(`/groups/${gid}/join`,'POST',{},b.cookie)).status,200);assert.equal((await req(`/groups/${gid}/join`,'POST',{},b.cookie)).status,400);assert.equal((await req(`/groups/${gid}/join`,'POST',{},c.cookie)).status,400);});
+test('mutual follows and private messages stay scoped to participant',async()=>{await req(`/users/${b.data.id}/follow`,'POST',{},a.cookie);await req(`/users/${a.data.id}/follow`,'POST',{},b.cookie);assert.equal((await req('/friends','GET',undefined,a.cookie)).data[0].mutual,1);await req(`/messages/${b.data.id}`,'POST',{body:'私聊测试'},a.cookie);assert.equal((await req(`/messages/${a.data.id}`,'GET',undefined,b.cookie)).data[0].body,'私聊测试');assert.equal((await req(`/messages/${a.data.id}`,'GET',undefined,c.cookie)).data.length,0);assert.equal((await req('/conversations','GET',undefined,a.cookie)).data[0].id,b.data.id);});
+test('invalid input and logout are handled',async()=>{assert.equal((await req('/posts?lat=abc')).status,400);assert.equal((await req('/posts/999999')).status,404);await req('/logout','POST',{},a.cookie);assert.equal((await req('/me','GET',undefined,a.cookie)).data,null);assert.equal((await req('/friends','GET',undefined,a.cookie)).status,401);const r=await fetch('http://127.0.0.1:3011/');assert.equal(r.status,200);assert.match(await r.text(),/出个门/);});
+
+test('demo has friend posts, conversations and personal records without duplicate fixtures',async()=>{
+ const user=b.data.id;
+ const profile=(await req('/users/'+user,'GET',undefined,b.cookie)).data;
+ assert.equal(profile.demo,true);
+ assert.equal(profile.posts.filter(p=>!p.original_id).length,3);
+ assert.ok(profile.posts.filter(p=>!p.original_id).every(p=>p.demo===1));
+ const before=(await req('/messages/1','GET',undefined,b.cookie)).data;
+ assert.equal(before.length,3);
+ assert.ok(before.some(m=>m.sender===user));
+ assert.ok(before.some(m=>m.recipient===user));
+ await req('/me','GET',undefined,b.cookie);
+ await req('/me','GET',undefined,b.cookie);
+ assert.equal((await req('/messages/1','GET',undefined,b.cookie)).data.length,3);
+ const friends=(await req('/friends/feed','GET',undefined,b.cookie)).data;
+ assert.equal(friends.filter(p=>p.user_id<=3).length,8);
+ assert.ok(friends.every(p=>p.user_id!==user));
+ assert.equal((await req('/friends/feed')).status,401);
+ const publicPosts=(await req('/posts')).data;
+ assert.ok(publicPosts.every(p=>p.user_id!==user));
+ const privateFeed=(await req('/posts','GET',undefined,b.cookie)).data;
+ assert.ok(privateFeed.some(p=>p.user_id===user));
+});
